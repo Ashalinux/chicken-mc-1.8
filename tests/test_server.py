@@ -53,6 +53,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(info["players"]["max"], 20)
         self.assertIn("Chicken", info["description"]["text"])
         self.assertEqual(pong, 0x0123456789ABCDEF)
+        # the program counts its own chickens and lines at runtime
+        with open(os.path.join(ROOT, "server.chicken"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("now with §6%d§f more chickens!" % src.count("chicken"),
+                      info["description"]["text"])
+        self.assertEqual(info["players"]["sample"][0]["name"],
+                         "§e%d lines of pure chicken" % (src.count("\n") + 1))
 
     def test_status_byte_by_byte(self):
         # framing is done in Chicken: feed the request one byte at a time
@@ -124,11 +131,33 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(r.rest(), bytes([0x7F]))
         pid, r = c.recv()
         self.assertEqual((pid, struct.unpack(">ii?", r.take(9))), (0x1B, (2, 1, False)))
+        # the flock, the hotbar, tab list, title and the welcome message
+        ids = [c.recv()[0] for _ in range(8 + 4 + 1 + 2)]
+        self.assertEqual(ids, [0x0F] * 8 + [0x2F] * 4 + [0x47, 0x45, 0x45])
+        pid, r = c.recv()
+        self.assertEqual(pid, 0x02)
+        self.assertIn("Welcome to the coop, §6Steve", r.string())
+        c.close()
+
+    def test_flock_and_hotbar(self):
+        c, _, _ = mcclient.login("Hen", port=self.port)
+        while c.recv()[0] != 0x1B:
+            pass
+        pid, r = c.recv()               # first hen: eid 3 at (5.5, 4, 5.5)
+        import struct
+        self.assertEqual((pid, r.varint(), r.take(1)[0]), (0x0F, 3, 93))
+        self.assertEqual(struct.unpack(">iii", r.take(12)), (176, 128, 176))
+        for _ in range(7):
+            pid, r = c.recv()
+        r.varint(); r.take(1 + 12 + 9)
+        self.assertEqual(r.rest(), bytes([0x0C, 0xFF, 0x7F]))   # last one is a chick
+        pid, r = c.recv()               # eggs in the first hotbar slot
+        self.assertEqual((pid, r.rest()), (0x2F, bytes([0, 0, 36, 0x01, 0x58, 16, 0, 0, 0])))
         c.close()
 
     def join(self, name):
         c, _, _ = mcclient.login(name, port=self.port)
-        while c.recv()[0] != 0x1B:      # skip to the end of the join sequence
+        while c.recv()[0] != 0x02:      # skip to the welcome message
             pass
         return c
 
@@ -136,21 +165,25 @@ class ServerTest(unittest.TestCase):
         import json
         c = self.join("Alex")
         # tick is 0.5 s in tests and a Keep Alive goes out every 5 ticks
-        seen = []
+        seen, clucks = [], 0
         while len(seen) < 2:
             pid, r = c.recv()
             if pid == 0x00:
                 kid = r.varint()
                 seen.append(kid)
                 c.send(0x00, mcclient.varint(kid))
+            elif pid == 0x29:
+                self.assertEqual(r.string(), "mob.chicken.say")
+                clucks += 1
         self.assertEqual(seen[1], seen[0] + 1)
+        self.assertGreaterEqual(clucks, 1)
         msg = 'hi "chicken" \\ \u00e9'
         c.send(0x01, mcclient.string(msg))
         while True:
             pid, r = c.recv()
             if pid == 0x02:
                 break
-        self.assertEqual(json.loads(r.string()), {"text": "<Alex> " + msg})
+        self.assertEqual(json.loads(r.string()), {"text": "<Alex> " + msg + " §7*bawk*"})
         self.assertEqual(r.take(1), b"\x00")
         c.close()
 

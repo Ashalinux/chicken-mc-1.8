@@ -17,6 +17,7 @@ var n m b hb flag q r i tmp
 var vs vn body blen send state slen
 var nlen npos k past c
 var cx cz cdata mlen j jb jl
+var tot lines nd wid
 var undef                       // never written: always 'undefined'
 array hexc 16                   // ASCII hex digits, filled at login
 array hi 256                    // hi[x] = 1 if x >= 128; MUST stay the last array
@@ -34,6 +35,23 @@ macro bstr S                    // append a protocol String (VarInt length + UTF
 endm
 macro isundef                   // top = (top is undefined)
   get undef ; eq
+endm
+macro cnt K                     // total += code cell j+K
+  get j ; push K ; add ; load ; add
+endm
+macro jopen S                  // start building a JSON text in the body
+  str S ; set body ; strlen S ; set blen
+endm
+macro mob EID X Z YAW           // Spawn Mob: a chicken at fixed-point X,Z (y=4), no metadata yet
+  begin 0x0F ; push EID ; call bvarint ; push 93 ; call bbyte
+  push X ; call bi32 ; push 128 ; call bi32 ; push Z ; call bi32
+  push YAW ; call bbyte ; push 0 ; call bbyte ; push YAW ; call bbyte
+  bs "\x00\x00\x00\x00\x00\x00"
+endm
+macro slot S IDLO CNT           // Set Slot: window 0, slot S, item 0x01IDLO x CNT
+  begin 0x2F ; bs "\x00\x00" ; push S ; call bbyte
+  bs "\x01" ; push IDLO ; call bbyte ; push CNT ; call bbyte
+  bs "\x00\x00\x00" ; call send_pkt
 endm
 
 // -------------------------------------------------------------------- init
@@ -67,6 +85,11 @@ on_tick:
   push 0 ; set tick
   begin 0
   get kaid ; call bvarint
+  call send_pkt
+  begin 0x29                    // Sound Effect: a cluck from the flock at (8.5, 4, 8.5)
+  bstr "mob.chicken.say"        //   String name, Int x y z (*8), Float volume, UByte pitch
+  bs "\x00\x00\x00\x44\x00\x00\x00\x20\x00\x00\x00\x44\x40" ; push 128 ; call bbyte
+  bs "\x00\x00\x3f"             //   volume 4.0 (heard 64 blocks away), pitch 100%
   call send_pkt
   inc kaid ; get kaid ; push 128 ; eq ; jf finish
   push 0 ; set kaid
@@ -133,7 +156,7 @@ d_ret:
   ret
 
 // Play: serverbound Keep Alive (0x00) needs no answer; Chat Message (0x01)
-// is echoed back as {"text":"<name> message"}.
+// is echoed back as {"text":"<name> message *bawk*"}.
 d_play:
   get id ; push 1 ; eq ; jf d_ret
   call rdvarint ; get n ; set mlen
@@ -157,12 +180,8 @@ chat_chr:
   get b ; call bbyte
   inc j ; jmp chat_msg
 chat_end:
-  bs "\"}"
-  get body ; set jb ; get blen ; set jl
-  begin 2                       // Chat Message: Chat json, Byte position
-  get jl ; call bvarint
-  get body ; get jb ; add ; set body
-  get blen ; get jl ; add ; set blen
+  bs " §7*bawk*\"}"
+  push 2 ; call wrap            // Chat Message: Chat json, Byte position
   push 0 ; call bbyte
   call send_pkt
   ret
@@ -172,9 +191,45 @@ d_status:
   get id ; push 1 ; eq ; jt st_ping
   ret
 st_request:                     // Status Response 0x00: String json
-  begin 0
-  bstr "{\"version\":{\"name\":\"1.8\",\"protocol\":47},\"players\":{\"max\":20,\"online\":0,\"sample\":[]},\"description\":{\"text\":\"§eA Minecraft server written in §6Chicken§e!\\n§7chicken chicken chicken\"}}"
+  call count                    // the program counts its own chickens, live
+  jopen "{\"version\":{\"name\":\"1.8\",\"protocol\":47},\"players\":{\"max\":20,\"online\":0,\"sample\":[{\"name\":\"§e"
+  get lines ; call bnum         // hover text over the player count
+  bs " lines of pure chicken\",\"id\":\"00000000-0000-0000-0000-000000000000\"},{\"name\":\"§7counted live by server.chicken itself\",\"id\":\"00000000-0000-0000-0000-000000000001\"}]},"
+  bs "\"description\":{\"text\":\"§eA Minecraft server written in §6Chicken§e!\\n§fnow with §6"
+  get tot ; call bnum
+  bs "§f more chickens!\"}}"
+  push 0 ; call wrap
   call send_pkt
+  ret
+
+// count: tot = number of 'chicken' words in this program = the sum of its
+// code cells (stack[2] up to the EXIT pad); lines = number of code cells.
+// Unrolled 16 cells at a time with the running total kept on the stack.
+count:
+  push &__end ; push 2 ; sub ; set lines
+  get lines ; set n ; call dm256          // blocks = lines div 16:
+  get q ; push 16 ; mul ; set nd          //   q*16 from the 256s ...
+  push 0 ; set c
+cnt_r:                                    //   ... plus r div 16 by counting
+  get r ; push 0 ; eq ; jt cnt_go
+  dec r ; inc c ; get c ; push 16 ; eq ; jf cnt_r
+  push 0 ; set c ; inc nd ; jmp cnt_r
+cnt_go:
+  push 2 ; set j
+  push 0                                  // running total
+cnt_b:
+  get nd ; push 0 ; eq ; jt cnt_s
+  get j ; load ; add
+  cnt 1 ; cnt 2 ; cnt 3 ; cnt 4 ; cnt 5 ; cnt 6 ; cnt 7 ; cnt 8
+  cnt 9 ; cnt 10 ; cnt 11 ; cnt 12 ; cnt 13 ; cnt 14 ; cnt 15
+  get j ; push 16 ; add ; set j
+  dec nd ; jmp cnt_b
+cnt_s:                                    // the last lines mod 16 cells
+  get j ; push &__end ; eq ; jt cnt_d
+  get j ; load ; add
+  inc j ; jmp cnt_s
+cnt_d:
+  set tot
   ret
 st_ping:                        // Pong 0x01: echo the 8-byte Long
   begin 1
@@ -277,6 +332,83 @@ cz_l:
   begin 0x1B                    // Attach Entity: Int rider, Int vehicle, Bool leash
   bs "\x00\x00\x00\x02\x00\x00\x00\x01\x00"
   call send_pkt
+
+  // A flock around the spawn: four hens and four chicks (Ageable age < 0).
+  mob 3 176 176 32 ; bs "\x7f" ; call send_pkt
+  mob 4 368 176 96 ; bs "\x7f" ; call send_pkt
+  mob 5 176 368 224 ; bs "\x7f" ; call send_pkt
+  mob 6 368 368 160 ; bs "\x7f" ; call send_pkt
+  mob 7 272 144 0 ; bs "\x0c" ; push 255 ; call bbyte ; bs "\x7f" ; call send_pkt
+  mob 8 272 400 128 ; bs "\x0c" ; push 255 ; call bbyte ; bs "\x7f" ; call send_pkt
+  mob 9 144 272 192 ; bs "\x0c" ; push 255 ; call bbyte ; bs "\x7f" ; call send_pkt
+  mob 10 400 272 64 ; bs "\x0c" ; push 255 ; call bbyte ; bs "\x7f" ; call send_pkt
+
+  slot 36 0x58 16               // hotbar: eggs, feathers, raw and cooked chicken
+  slot 37 0x20 64
+  slot 38 0x6d 64
+  slot 39 0x6e 64
+
+  begin 0x47                    // Player List Header And Footer: Chat, Chat
+  bstr "{\"text\":\"§6§lThe Chicken Coop\"}"
+  bstr "{\"text\":\"§7100% written in Chicken §8(chicken chicken chicken)\"}"
+  call send_pkt
+
+  begin 0x45                    // Title: VarInt action (1 subtitle, 0 title), Chat
+  bs "\x01" ; bstr "{\"text\":\"§7chicken chicken chicken\"}"
+  call send_pkt
+  begin 0x45
+  bs "\x00" ; bstr "{\"text\":\"§6§lCHICKEN\"}"
+  call send_pkt
+
+  jopen "{\"text\":\"§eYou hatched! Welcome to the coop, §6"
+  call bname
+  bs "§e. Say something, the coop will answer.\"}"
+  push 2 ; call wrap ; push 0 ; call bbyte
+  call send_pkt
+  ret
+
+// wrap: turn the JSON text built in the body into packet <id on stack>
+// starting with that String; more fields may be appended afterwards.
+wrap:
+  set wid
+  get body ; set jb ; get blen ; set jl
+  get wid ; char ; set body ; push 1 ; set blen
+  get jl ; call bvarint
+  get body ; get jb ; add ; set body
+  get blen ; get jl ; add ; set blen
+  ret
+
+// bname: append the player name to the body
+bname:
+  push 0 ; set j
+bname_l:
+  get j ; get nlen ; eq ; jt bname_d
+  get npos ; get j ; add ; in ; call bbyte
+  inc j ; jmp bname_l
+bname_d:
+  ret
+
+// bnum: append a number in decimal.  JS-style 'add' turns it into digits
+// for free; to count them, the string n+"chicken" is parked in code cell 2
+// (already executed) and indexed with 'pick' from that cell until undefined.
+bnum:
+  set nd
+  get body ; get nd ; add ; set body
+  get nd ; chicken ; add ; push 2 ; store
+  push 0 ; set nd
+bnum_l:
+  get nd ; raw 6 ; raw 2 ; isundef ; jt bnum_d
+  inc nd ; jmp bnum_l
+bnum_d:
+  get blen ; get nd ; add ; push 7 ; sub ; set blen
+  ret
+
+// bi32: append a non-negative Int below 65536
+bi32:
+  set n
+  push 0 ; call bbyte ; push 0 ; call bbyte
+  call dm256
+  get q ; call bbyte ; get r ; call bbyte
   ret
 
 // mkchunk: cdata = one 16x16x16 section + light + biomes (12544 bytes).

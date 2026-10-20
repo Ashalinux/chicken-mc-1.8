@@ -51,6 +51,8 @@ These follow esolangs.org. Where the page is silent, the original `chicken-origi
 | 4 | **Joining the world.** Join Game (creative, `flat`), Spawn Position, 7×7 chunks (bedrock, dirt, dirt, grass, built by string doubling), Player Position And Look. |
 | 5 | **Staying connected.** A Keep Alive goes out every 5 ticks (one tick per second from the host). Chat is echoed back as `<name> message`, with `"` and `\` escaped. |
 | extra | **The player is a chicken.** The player is made invisible and a chicken rides on it, visible in F5. |
+| extra | **Live MOTD numbers.** The second MOTD line reads "now with N more chickens!", and the hover text shows "M lines of pure chicken". Both are counted at runtime by `server.chicken` reading its own code cells, which takes about 0.25 s per server-list ping. |
+| extra | **The coop.** On join there's a flock of 4 hens and 4 chicks around the spawn, eggs, feathers and chicken in the hotbar, a "CHICKEN" title, a tab-list header and footer, and a welcome message. A cluck plays every 5 s, and chat echoes end in `*bawk*`. |
 
 ## Deviations / limits
 - **Offline UUID.** Vanilla uses MD5(`OfflinePlayer:`+name). Chicken has no bitwise operations or division, so MD5 is impractical. The UUID is derived from the name's bytes instead.
