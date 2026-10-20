@@ -1,0 +1,423 @@
+// Minecraft 1.8 (protocol 47) server logic, assembled to server.chicken.
+//
+// INPUT (a list of byte values, see HOST_SURFACE.md):
+//   input[0]      event: 0 = connection opened, 1 = bytes received, 2 = tick, 3 = closed
+//   input[1..2]   state length, big-endian (counts the bytes after these two)
+//   input[3]      phase: 0 handshake, 1 status, 2 login, 3 play
+//   input[4]      tick counter
+//   input[5]      keep-alive id
+//   input[6]      player name length (0 before login)
+//   input[7..]    player name bytes
+//   then          unconsumed bytes from earlier events, then this event's bytes
+// OUTPUT (top of stack, a string of &#N; entities = bytes):
+//   [len_hi len_lo phase tick kaid nlen name... leftover...] [bytes to send...]
+
+var ev pos p pend len id phase tick kaid
+var n m b hb flag q r i tmp
+var vs vn body blen send state slen
+var nlen npos k past c
+var cx cz cdata mlen j jb jl
+var undef                       // never written: always 'undefined'
+array hexc 16                   // ASCII hex digits, filled at login
+array hi 256                    // hi[x] = 1 if x >= 128; MUST stay the last array
+
+// ------------------------------------------------------------------ macros
+macro begin ID                  // start a packet body with its id
+  push ID ; char ; set body ; push 1 ; set blen
+endm
+macro bs S                      // append literal bytes to the body
+  get body ; str S ; add ; set body
+  get blen ; strlen S ; add ; set blen
+endm
+macro bstr S                    // append a protocol String (VarInt length + UTF-8)
+  strlen S ; call bvarint ; bs S
+endm
+macro isundef                   // top = (top is undefined)
+  get undef ; eq
+endm
+
+// -------------------------------------------------------------------- init
+start:
+  push 0                        // sentinel: keeps ops from landing on the EXIT pad
+  push __cstk ; set __csp
+  push 0 ; set send
+  push 0 ; set i ; push 0 ; set flag
+hi_loop:
+  get i ; push 128 ; eq ; jf hi_1 ; push 1 ; set flag
+hi_1:
+  get flag ; push hi ; get i ; add ; store
+  inc i ; get i ; push 256 ; eq ; jf hi_loop
+
+  push 0 ; in ; set ev
+  push 6 ; set pos
+  get ev ; push 0 ; eq ; jt on_open
+  push 3 ; in ; set phase
+  push 4 ; in ; set tick
+  push 5 ; in ; set kaid
+  push 6 ; in ; set nlen ; push 7 ; set npos
+  push 7 ; get nlen ; add ; set pos
+  get ev ; push 1 ; eq ; jt parse
+  get ev ; push 2 ; eq ; jt on_tick
+  jmp finish                    // close: nothing to do
+
+// Keep Alive: every 5 ticks while playing, with an id that counts 0..127
+on_tick:
+  get phase ; push 3 ; eq ; jf finish
+  inc tick ; get tick ; push 5 ; eq ; jf finish
+  push 0 ; set tick
+  begin 0
+  get kaid ; call bvarint
+  call send_pkt
+  inc kaid ; get kaid ; push 128 ; eq ; jf finish
+  push 0 ; set kaid
+  jmp finish
+
+on_open:
+  push 0 ; set phase ; push 0 ; set tick ; push 0 ; set kaid
+  push 0 ; set nlen ; push 7 ; set npos
+  jmp finish
+
+// ------------------------------------------------------- packet framing
+parse:
+  get pos ; in ; isundef ; jt finish
+  get pos ; set p
+  call rdvarint                 // packet length
+  get flag ; jt finish          // length itself incomplete: keep as leftover
+  get n ; set len
+  get p ; get len ; add ; set pend
+  get len ; push 0 ; eq ; jt next_pkt
+  get pend ; push 1 ; sub ; in ; isundef ; jt finish   // body incomplete
+  get p ; in ; set id ; inc p
+  call dispatch
+next_pkt:
+  get pend ; set pos
+  jmp parse
+
+// ---------------------------------------------------------------- output
+finish:
+  get phase ; char ; get tick ; char ; add ; get kaid ; char ; add
+  get nlen ; char ; add ; set state
+  push 4 ; get nlen ; add ; set slen
+  push 0 ; set k
+fin_name:                       // keep the player name
+  get k ; get nlen ; eq ; jt fin_left
+  get state ; get npos ; get k ; add ; in ; char ; add ; set state
+  inc k ; jmp fin_name
+fin_left:                       // keep unconsumed bytes for the next event
+  get pos ; in ; set b ; get b ; isundef ; jt fin_hdr
+  get state ; get b ; char ; add ; set state
+  inc slen ; inc pos ; jmp fin_left
+fin_hdr:
+  get slen ; set n ; call dm256
+  get q ; char ; get r ; char ; add ; get state ; add
+  get send ; push 0 ; eq ; jt fin_out
+  get send ; add
+fin_out:
+  halt
+
+// ------------------------------------------------------------- dispatch
+dispatch:
+  get phase ; push 0 ; eq ; jt d_hand
+  get phase ; push 1 ; eq ; jt d_status
+  get phase ; push 2 ; eq ; jt d_login
+  get phase ; push 3 ; eq ; jt d_play
+  ret
+
+d_hand:                         // Handshake 0x00: VarInt proto, String addr, UShort port, VarInt next
+  get id ; push 0 ; eq ; jf d_ret
+  call rdvarint
+  call rdvarint ; get p ; get n ; add ; set p
+  get p ; push 2 ; add ; set p
+  call rdvarint ; get n ; set phase
+d_ret:
+  ret
+
+// Play: serverbound Keep Alive (0x00) needs no answer; Chat Message (0x01)
+// is echoed back as {"text":"<name> message"}.
+d_play:
+  get id ; push 1 ; eq ; jf d_ret
+  call rdvarint ; get n ; set mlen
+  str "{\"text\":\"<" ; set body ; strlen "{\"text\":\"<" ; set blen
+  push 0 ; set j
+chat_name:
+  get j ; get nlen ; eq ; jt chat_sep
+  get npos ; get j ; add ; in ; call bbyte
+  inc j ; jmp chat_name
+chat_sep:
+  bs "> "
+  push 0 ; set j
+chat_msg:                       // copy the message, escaping " and \ for JSON
+  get j ; get mlen ; eq ; jt chat_end
+  get p ; get j ; add ; in ; set b
+  get b ; push 34 ; eq ; jt chat_esc
+  get b ; push 92 ; eq ; jf chat_chr
+chat_esc:
+  push 92 ; call bbyte
+chat_chr:
+  get b ; call bbyte
+  inc j ; jmp chat_msg
+chat_end:
+  bs "\"}"
+  get body ; set jb ; get blen ; set jl
+  begin 2                       // Chat Message: Chat json, Byte position
+  get jl ; call bvarint
+  get body ; get jb ; add ; set body
+  get blen ; get jl ; add ; set blen
+  push 0 ; call bbyte
+  call send_pkt
+  ret
+
+d_status:
+  get id ; push 0 ; eq ; jt st_request
+  get id ; push 1 ; eq ; jt st_ping
+  ret
+st_request:                     // Status Response 0x00: String json
+  begin 0
+  bstr "{\"version\":{\"name\":\"1.8\",\"protocol\":47},\"players\":{\"max\":20,\"online\":0,\"sample\":[]},\"description\":{\"text\":\"§eA Minecraft server written in §6Chicken§e!\\n§7chicken chicken chicken\"}}"
+  call send_pkt
+  ret
+st_ping:                        // Pong 0x01: echo the 8-byte Long
+  begin 1
+  push 8 ; set i
+st_ping_l:
+  get p ; in ; call bbyte ; inc p
+  dec i ; get i ; push 0 ; eq ; jf st_ping_l
+  call send_pkt
+  ret
+
+d_login:                        // Login Start 0x00: String name
+  get id ; push 0 ; eq ; jf d_ret
+  call rdvarint ; get n ; set nlen ; get p ; set npos
+  call init_hex
+  begin 2                       // Login Success 0x02: String uuid, String name
+  push 36 ; call bvarint
+  push 0 ; set k ; push 0 ; set past
+uuid_l:                         // 16 bytes: the name, zero padded
+  get k ; get nlen ; eq ; jf uuid_1 ; push 1 ; set past
+uuid_1:
+  get k ; push 4 ; eq ; jt uuid_dash
+  get k ; push 6 ; eq ; jt uuid_dash
+  get k ; push 8 ; eq ; jt uuid_dash
+  get k ; push 10 ; eq ; jf uuid_2
+uuid_dash:
+  push 45 ; call bbyte
+uuid_2:
+  push 0 ; set n
+  get past ; jt uuid_3
+  get npos ; get k ; add ; in ; set n
+uuid_3:
+  call hex2
+  inc k ; get k ; push 16 ; eq ; jf uuid_l
+  get nlen ; call bvarint
+  push 0 ; set k
+name_l:
+  get k ; get nlen ; eq ; jt name_d
+  get npos ; get k ; add ; in ; call bbyte
+  inc k ; jmp name_l
+name_d:
+  call send_pkt
+  push 3 ; set phase
+  call join
+  ret
+
+// ---------------------------------------------------------------- join
+// World: flat 7x7 chunks around 0,0; bedrock y=0, dirt y=1-2, grass y=3.
+join:
+  begin 1                       // Join Game: Int eid, UByte gamemode, Byte dim,
+  bs "\x00\x00\x00\x01"         //   UByte difficulty, UByte max players,
+  bs "\x01\x00\x00\x14"         //   String level type, Bool reduced debug
+  bstr "flat"
+  push 0 ; call bbyte
+  call send_pkt
+
+  begin 5                       // Spawn Position (8, 4, 8): x<<38 | y<<26 | z
+  bs "\x00\x00\x02\x00\x10\x00\x00\x08"
+  call send_pkt
+
+  call mkchunk
+  push 0 ; set cx
+cx_l:
+  push 0 ; set cz
+cz_l:
+  begin 0x21                    // Chunk Data: Int x, Int z, Bool ground-up,
+  get cx ; call bint            //   UShort bitmask, VarInt size, data
+  get cz ; call bint
+  push 1 ; call bbyte
+  push 0 ; call bbyte ; push 1 ; call bbyte
+  push 12544 ; call bvarint
+  get body ; get cdata ; add ; set body
+  get blen ; push 12544 ; add ; set blen
+  call send_pkt
+  inc cz ; get cz ; push 7 ; eq ; jf cz_l
+  inc cx ; get cx ; push 7 ; eq ; jf cx_l
+
+  begin 8                       // Player Position And Look: x y z (double),
+  bs "\x40\x21\x00\x00\x00\x00\x00\x00"   //   yaw pitch (float), flags
+  bs "\x40\x10\x00\x00\x00\x00\x00\x00"   //   x=8.5 y=4.0 z=8.5
+  bs "\x40\x21\x00\x00\x00\x00\x00\x00"
+  bs "\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+  call send_pkt
+
+  // The player is a chicken: 1.8 can't change the local player's model, so
+  // the player (eid 1) turns invisible and a chicken (eid 2) rides on it;
+  // the client then carries the chicken along with every move.
+  begin 0x1C                    // Entity Metadata: VarInt eid, entries...
+  bs "\x01"                     //   eid 1 (the player)
+  bs "\x00\x20\x7f"             //   index 0 (byte) = 0x20 invisible; end
+  call send_pkt
+
+  begin 0x0F                    // Spawn Mob: VarInt eid, UByte type, Int x y z
+  bs "\x02\x5d"                 //   (fixed-point *32), Byte yaw pitch head,
+  bs "\x00\x00\x01\x10"         //   Short velocity x3, metadata
+  bs "\x00\x00\x00" ; push 128 ; call bbyte
+  bs "\x00\x00\x01\x10"
+  bs "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x7f"
+  call send_pkt
+
+  begin 0x1B                    // Attach Entity: Int rider, Int vehicle, Bool leash
+  bs "\x00\x00\x00\x02\x00\x00\x00\x01\x00"
+  call send_pkt
+  ret
+
+// mkchunk: cdata = one 16x16x16 section + light + biomes (12544 bytes).
+// Built by doubling: every part is one short or byte repeated 2^k times.
+mkchunk:
+  push 112 ; call layer ; get tmp ; set cdata          // bedrock (7<<4)
+  push 48 ; call layer
+  get cdata ; get tmp ; add ; get tmp ; add ; set cdata   // 2x dirt (3<<4)
+  push 32 ; call layer
+  get cdata ; get tmp ; add ; set cdata               // grass (2<<4)
+  push 0 ; push 13 ; call rep                         // 12 air layers + block light
+  push 255 ; push 11 ; call rep                       // sky light: full
+  push 1 ; push 8 ; call rep                          // 256 biomes: plains
+  ret
+layer:                          // tmp = 256 x little-endian short (top)
+  char ; push 0 ; char ; add ; set tmp
+  push 8 ; set k ; call dbl
+  ret
+rep:                            // cdata += byte (below) repeated 2^(top) times
+  set k ; char ; set tmp ; call dbl
+  get cdata ; get tmp ; add ; set cdata
+  ret
+dbl:                            // tmp = tmp doubled k times
+  get k ; push 0 ; eq ; jt dbl_d
+  get tmp ; get tmp ; add ; set tmp
+  dec k ; jmp dbl
+dbl_d:
+  ret
+
+// bint: append Int (index 0..6 on stack, meaning chunk coordinate index-3)
+bint:
+  set c
+  get c ; push 0 ; eq ; jt bint_neg
+  get c ; push 1 ; eq ; jt bint_neg
+  get c ; push 2 ; eq ; jt bint_neg
+  push 0 ; call bbyte ; push 0 ; call bbyte ; push 0 ; call bbyte
+  get c ; push 3 ; sub ; call bbyte
+  ret
+bint_neg:
+  push 255 ; call bbyte ; push 255 ; call bbyte ; push 255 ; call bbyte
+  get c ; push 253 ; add ; call bbyte
+  ret
+
+// ------------------------------------------------------------ helpers
+// init_hex: hexc[d] = ASCII of hex digit d
+init_hex:
+  push 0 ; set k ; push 48 ; set c
+ih_l:
+  get k ; push 10 ; eq ; jf ih_1
+  get c ; push 39 ; add ; set c
+ih_1:
+  get c ; push hexc ; get k ; add ; store
+  inc c ; inc k ; get k ; push 16 ; eq ; jf ih_l
+  ret
+
+// hex2: append the two hex digits of byte n to the body
+hex2:
+  push 0 ; set q ; push 0 ; set r
+h2_l:
+  get n ; push 0 ; eq ; jt h2_d
+  dec n ; inc r ; get r ; push 16 ; eq ; jf h2_l
+  push 0 ; set r ; inc q ; jmp h2_l
+h2_d:
+  push hexc ; get q ; add ; load ; call bbyte
+  push hexc ; get r ; add ; load ; call bbyte
+  ret
+
+// rdvarint: n = VarInt at input[p], p advanced; flag = 1 if it ran off the end
+rdvarint:
+  push 0 ; set n ; push 1 ; set m ; push 0 ; set flag
+rv_loop:
+  get p ; in ; set b
+  get b ; isundef ; jf rv_1
+  push 1 ; set flag ; ret
+rv_1:
+  inc p
+  push hi ; get b ; add ; load ; set hb
+  get b ; push 128 ; get hb ; mul ; sub ; get m ; mul ; get n ; add ; set n
+  get m ; push 128 ; mul ; set m
+  get hb ; jt rv_loop
+  ret
+
+// dm256 / dm128: q, r = divmod(n, 256 / 128).  n < 256 exactly when hi[n]
+// exists, because hi is the highest allocation in memory.
+dm256:
+  push 0 ; set q
+dm256_l:
+  push hi ; get n ; add ; load ; isundef ; jf dm256_d
+  get n ; push 256 ; sub ; set n ; inc q ; jmp dm256_l
+dm256_d:
+  get n ; set r ; ret
+
+dm128:
+  call dm256
+  get q ; get q ; add ; set q   // q *= 2
+  push hi ; get r ; add ; load ; jf dm128_d
+  inc q ; get r ; push 128 ; sub ; set r
+dm128_d:
+  ret
+
+// vstr: vs = VarInt encoding of n as an entity string, vn = its byte count
+vstr:
+  push 0 ; set vn ; push 0 ; set vs
+vstr_l:
+  call dm128
+  get q ; push 0 ; eq ; jt vstr_last
+  get r ; push 128 ; add ; call vs_app
+  get q ; set n ; jmp vstr_l
+vstr_last:
+  get r ; call vs_app
+  ret
+vs_app:                         // append byte (top) to vs
+  char ; set tmp
+  get vs ; push 0 ; eq ; jf vs_app_1
+  get tmp ; set vs ; jmp vs_app_2
+vs_app_1:
+  get vs ; get tmp ; add ; set vs
+vs_app_2:
+  inc vn
+  ret
+
+// bbyte: append byte (top) to body
+bbyte:
+  char ; set tmp
+  get body ; get tmp ; add ; set body
+  inc blen
+  ret
+
+// bvarint: append VarInt (top) to body
+bvarint:
+  set n ; call vstr
+  get body ; get vs ; add ; set body
+  get blen ; get vn ; add ; set blen
+  ret
+
+// send_pkt: send += VarInt(blen) + body
+send_pkt:
+  get blen ; set n ; call vstr
+  get vs ; get body ; add ; set tmp
+  get send ; push 0 ; eq ; jf send_1
+  get tmp ; set send ; ret
+send_1:
+  get send ; get tmp ; add ; set send
+  ret
